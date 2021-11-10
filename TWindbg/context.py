@@ -10,7 +10,7 @@ from utils import *
 ARCH = None
 PTRMASK = None
 PTRSIZE = None
-MAX_DEREF = 20
+MAX_DEREF = 5
 
 def init_arch():
     global ARCH, PTRMASK, PTRSIZE
@@ -99,13 +99,15 @@ class ContextHandler(pykd.eventHandler):
 
     def print_context(self):
         self.context.update_regs()
-        pykd.dprintln(color.yellow("[------ Register --------------------------------------------------------------------------------------------]"), dml=True)
+        pykd.dprintln(color.blue("[------ Register --------------------------------------------------------------------------------------------]"), dml=True)
         self.print_regs()
-        pykd.dprintln(color.yellow("[------ Code ------------------------------------------------------------------------------------------------]"), dml=True)
+        pykd.dprintln(color.blue("[------ Navigator -------------------------------------------------------------------------------------------]"), dml=True)
+        self.print_navigator()
+        pykd.dprintln(color.blue("[------ Code ------------------------------------------------------------------------------------------------]"), dml=True)
         self.print_code()
-        pykd.dprintln(color.yellow("[------ Stack -----------------------------------------------------------------------------------------------]"), dml=True)
+        pykd.dprintln(color.blue("[------ Stack -----------------------------------------------------------------------------------------------]"), dml=True)
         self.print_stack()
-        pykd.dprintln(color.yellow("[------------------------------------------------------------------------------------------------------------]"), dml=True)
+        pykd.dprintln(color.blue("[------------------------------------------------------------------------------------------------------------]"), dml=True)
         
     def print_regs(self):
         self.print_general_regs()
@@ -120,7 +122,10 @@ class ContextHandler(pykd.eventHandler):
             pykd.dprint(reg_color(reg_str), dml=True)
 
             if pykd.isValid(reg_data): # reg_data is a pointer
-                self.print_ptrs(reg_data)
+                try:
+                    self.print_ptrs(reg_data)
+                except:
+                    pykd.dprintln("{:#x}".format(reg_data))
             else:
                 pykd.dprintln("{:#x}".format(reg_data))
 
@@ -158,16 +163,143 @@ class ContextHandler(pykd.eventHandler):
         else:
             return color_unchanged
 
-    def print_code(self):
+    def print_navigator(self):
+        def is_hex(data):
+            try:
+                int(data, 16)
+                return True
+            except:
+                return False
+
+        def expr(data):
+            if (s_i:=data.find("[")) != -1 and (e_i:=data.rfind("]")) != -1:
+                # return pykd.expr(data[s_i+1:e_i])
+                data = data[s_i+1:e_i]
+                s = ''
+                t = ''
+                
+                if (s_i:=data.find("(")) != -1 and (e_i:=data.rfind(")")) != -1:
+                    data = (data[s_i+1:e_i]).replace("`", "")
+                    return int(data, 16)
+
+                for i, v in enumerate(data):
+                    if v not in ['+', '-', '*', '/']:
+                        t += v
+                    elif is_hex(t):
+                        s += (str(int(t, 16)) + v)
+                        t = ''
+                    else:
+                        s += (str(pykd.reg(t)) + v)
+                        t = ''
+                if t != '':
+                    if (t[-1] == 'h') and is_hex(t[:-1]):
+                        s += str(int(t[:-1], 16))
+                    elif is_hex(t):
+                        s+= str(int(t, 16))
+                    else:
+                        s += str(pykd.reg(t))
+                return eval(s)
+
+        def calc(data):
+            try:
+                return pykd.reg(data)
+            except pykd.DbgException:
+                if data.find("qword ptr") != -1:
+                    return pykd.loadQWords(expr(data), 1)[0]
+                elif data.find("dword ptr") != -1:
+                    return pykd.loadDWords(expr(data), 1)[0]
+                elif data.find("word ptr") != -1:
+                    return pykd.loadWords(expr(data), 1)[0]
+                elif data.find("byte ptr") != -1:
+                    return pykd.loadBytes(expr(data), 1)[0]
+                else:
+                    return expr(data)
+
         pc = self.context.pc
-        for offset in range(-3, 6): # pc-3 ~ pc+5
+        op_str, asm_str = disasm(pc)
+        t = asm_str.split(" ")
+        operator, operand = t[0], ' '.join(t[1:]).strip()
+        try:
+            if operand.find(",") != -1:
+                operand_1, operand_2 = operand.split(",")
+                value_1, value_2 = calc(operand_1), calc(operand_2)
+                if pykd.isValid(value_1): # reg_data is a pointer
+                    pykd.dprint("{} = ".format(operand_1), dml=True)
+                    self.print_ptrs(value_1)
+                else:
+                    pykd.dprintln("{} = {:#x}".format(operand_1, value_1), dml=True)
+
+                if pykd.isValid(value_2): # reg_data is a pointer
+                    pykd.dprint("{} = ".format(operand_2), dml=True)
+                    self.print_ptrs(value_2)
+                else:
+                    pykd.dprintln("{} = {:#x}".format(operand_2, value_2), dml=True)
+            else:
+                value = calc(operand)
+                if pykd.isValid(value): # reg_data is a pointer
+                    pykd.dprint("{} = ".format(operand), dml=True)
+                    self.print_ptrs(value)
+                else:
+                    pykd.dprintln("{} = {:#x}".format(operand, value), dml=True)
+        except:
+            pass
+
+    def print_code(self):
+        def parse_jmp_addr(data):
+            op_str, asm_str = disasm(pc)
+            t = asm_str.split(" ")
+            operator, operand = t[0], ' '.join(t[1:]).strip()
+            if operator in ["jmp", "je", "jz", "jne", "jnz", "js", "jns", "jg", 
+                          "jnle", "jge", "jnl", "jl", "jnge", "jle", "jng", 
+                          "ja", "jnbe", "jae", "jnb", "jb", "jnae", "jbe", "jna"]:
+                return operator, pykd.expr(operand.split(" ")[1])
+            return operator, 0
+
+        def chk_eflag(name):
+            for bit, flag_name in self.context.eflags_tbl.items():
+                if flag_name == name:
+                    is_set = pykd.reg('efl') & (1<<bit)
+                    return is_set
+        flag = False
+        pc = self.context.pc
+        j_oper, j_addr = parse_jmp_addr(pc)
+        if  (j_oper in ['jmp']) or \
+            (j_oper in ['je', 'jz'] and chk_eflag('zero')) or \
+            (j_oper in ['jne', 'jnz'] and (not chk_eflag('zero')) ) or \
+            (j_oper in ['js'] and chk_eflag('sign')) or \
+            (j_oper in ['jns'] and (not chk_eflag('sign')) ) or \
+            (j_oper in ['jg', 'jnle'] and (not chk_eflag('zero') and (chk_eflag("sign")^chk_eflag('overflow'))) ) or \
+            (j_oper in ['jge', 'jnl'] and (not (chk_eflag("sign")^chk_eflag('overflow'))) ) or \
+            (j_oper in ['jl', 'jnge'] and (chk_eflag('sign')^chk_eflag('overflow')) ) or \
+            (j_oper in ['jle', 'jng'] and ((chk_eflag('sign')^chk_eflag('overflow')) or chk_eflag('zero')) ) or \
+            (j_oper in ['ja', 'jnbe'] and (not chk_eflag('carry') and not chk_eflag('zero')) ) or \
+            (j_oper in ['jae', 'jnb'] and (not chk_eflag('carry')) ) or \
+            (j_oper in ['jb', 'jnae'] and chk_eflag('carry') ) or \
+            (j_oper in ['jbe', 'jna'] and (chk_eflag('carry') or chk_eflag('zero')) ):
+            flag = True
+
+        for offset in range(-5, 20): # pc-5 ~ pc+20
             addr = pykd.disasm().findOffset(offset)
             op_str, asm_str = disasm(addr)
-            code_str = "{:#x}: {:20s}{}".format(addr, op_str, asm_str)
+            code_str = "{:#x}: {:30s}{}".format(addr, op_str, asm_str)
             if addr == pc: # current pc, highlight
-                pykd.dprintln(color.lime_highlight(code_str), dml=True)
+                if flag == True:
+                    pykd.dprintln(color.red_highlight(code_str), dml=True)
+                else:
+                    pykd.dprintln(color.lime_highlight(code_str), dml=True)
+            elif addr == j_addr:
+                if flag == True:
+                    pykd.dprintln(color.orange(code_str), dml=True)
+                else:
+                    pykd.dprintln(color.green(code_str), dml=True)
             else:
-                pykd.dprintln(code_str)
+                t = asm_str.split(" ")
+                operator, operand = t[0], ' '.join(t[1:]).strip()
+                if operator == 'call':
+                    pykd.dprintln(color.skyblue(code_str), dml=True)
+                else:
+                    pykd.dprintln(code_str, dml=True)
+        flag = False
     
     def print_stack(self):
         self.print_nline_ptrs(self.context.sp, 8)
@@ -202,12 +334,12 @@ class ContextHandler(pykd.eventHandler):
             symbol = pykd.findSymbol(ptr) + ":"
             asm_str = disasm(ptr)[1]
             ret_str = "{:#x}".format(ptr)
-            ret_str += color.gray(" ({:45s}{})".format(symbol, asm_str))
+            ret_str += color.skyblue(" ({:45s}{})".format(symbol, asm_str))
         else:
             ret_str = "{:#x} --> {:#x}".format(ptr, val)
             val_str = get_string(ptr)
             if val_str: # val is probably a string
-                ret_str += color.white(" (\"{}\")".format(val_str))
+                ret_str += color.purple(" (\"{}\")".format(val_str))
         return ret_str
 
     def smart_dereference(self, ptr):

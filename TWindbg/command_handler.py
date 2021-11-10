@@ -9,7 +9,7 @@ def set_alias(a, v):
     pykd.dbgCommand("as {} {}".format(a, v))
 
 def wrap_command(cmd, real_cmd):
-    set_alias(cmd, "!py -g winext\TWindbg\command_handler.py {}".format(real_cmd))
+    set_alias(cmd, "!py -g twindbg/command_handler.py {}".format(real_cmd))
 
 def wrap_all_commands():
     for cmd in command.all_commands:
